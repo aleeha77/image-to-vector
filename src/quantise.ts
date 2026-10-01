@@ -148,7 +148,6 @@ export function quantise(
 
   // 3. Palette = population-weighted mean of each box.
   const palette: number[] = [];
-  const representatives: number[] = []; // packed key per box, for the LUT
   for (const box of boxes) {
     let n = 0;
     let r = 0;
@@ -164,7 +163,6 @@ export function quantise(
     const pg = Math.round(g / n);
     const pb = Math.round(b / n);
     palette.push((pr << 16) | (pg << 8) | pb);
-    representatives.push(box.bins[0]);
   }
 
   // 4. Bin -> palette lookup, computed once per bin rather than per pixel.

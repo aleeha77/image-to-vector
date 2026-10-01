@@ -12,6 +12,7 @@
  */
 import { optimize, vectorizeRaw } from "@neplex/vectorizer";
 import sharp from "sharp";
+import { quantise } from "./quantise";
 
 // `@neplex/vectorizer` exposes its enums as plain i32s at runtime (the TS
 // `declare enum`s are erased), so these constants are the ABI, not a style choice.
@@ -129,7 +130,7 @@ export const TUNING: Record<PresetId, PresetTuning> = {
   // in a logo upload collapses into clean flat shapes instead of confetti.
   logo: {
     colorMode: "color",
-    hierarchical: "stacked",
+    hierarchical: "cutout",
     speckle: [3, 12],
     precision: [7, 4],
     layers: [10, 28],
@@ -142,7 +143,7 @@ export const TUNING: Record<PresetId, PresetTuning> = {
     median: 3,
     blur: 0,
     saturation: 1.05,
-    palette: 24,
+    palette: 0,
     dither: 0,
   },
   // Ink / pencil drawings: auto-levelled, denoised, hard-thresholded to a 1-bit
@@ -185,7 +186,7 @@ export const TUNING: Record<PresetId, PresetTuning> = {
     median: 3,
     blur: 0.7,
     saturation: 1.04,
-    palette: 48,
+    palette: 0,
     dither: 0,
   },
   // Textiles, dress prints, wallpaper: dense mid-size motifs, dozens of colours,
@@ -194,20 +195,20 @@ export const TUNING: Record<PresetId, PresetTuning> = {
   // real pixels to fit curves to.
   pattern: {
     colorMode: "color",
-    hierarchical: "stacked",
+    hierarchical: "cutout",
     speckle: [1, 8],
     precision: [8, 5],
-    layers: [16, 40],
+    layers: [12, 32],
     cornerThreshold: 60,
     lengthThreshold: 3.2,
     spliceThreshold: 45,
     pathPrecision: 2,
     maxDim: 1700,
     minDim: 1200,
-    median: 3,
+    median: 5,
     blur: 0,
     saturation: 1.12,
-    palette: 40,
+    palette: 0,
     dither: 0,
   },
 };
@@ -338,18 +339,24 @@ export async function traceImage(input: Buffer, options: TraceOptions): Promise<
       steps.push(`colour separation widened (saturation ×${t.saturation.toFixed(2)})`);
     }
     if (t.palette > 0) {
-      // Round-trip through a palette PNG: libimagequant merges the grain into flat
-      // colour regions, which is what makes a busy print trace as clean shapes.
-      const quantised = await pipeline
-        .png({ palette: true, colours: t.palette, dither: t.dither, effort: 6, compressionLevel: 0 })
-        .toBuffer();
-      pipeline = sharp(quantised).toColourspace("srgb");
-      steps.push(`quantised to ${String(t.palette)} colours (libimagequant)`);
+      // Handled after the raw decode below — the quantiser works on pixels.
+      steps.push(`quantised to ${String(t.palette)} flat colours (median cut)`);
     }
   }
 
   const { data, info } = await pipeline.raw().toBuffer({ resolveWithObject: true });
-  const rgba = asRgba(data, info.channels);
+  let rgba = asRgba(data, info.channels);
+  let inkMeanLuma = -1;
+  if (preset === "lineart") {
+    // The 1-bit mask is almost always dark ink on light paper; remember which way
+    // round it is so the exported SVG carries its own background rather than
+    // relying on whatever the viewer puts behind it.
+    let sum = 0;
+    for (let i = 0; i < rgba.length; i += 4) sum += rgba[i];
+    inkMeanLuma = sum / (rgba.length / 4);
+  } else if (t.palette > 0 && t.palette < 256) {
+    rgba = quantise(rgba, 4, info.width, info.height, t.palette).rgba;
+  }
   const config = buildConfig(preset, detail);
   steps.push(
     `traced ${String(info.width)}×${String(info.height)} · ${String(config.filterSpeckle)}px speckle` +
@@ -367,6 +374,14 @@ export async function traceImage(input: Buffer, options: TraceOptions): Promise<
     svg = raw;
   }
   svg = normaliseSvgHeader(svg, info.width, info.height);
+  if (inkMeanLuma >= 0) {
+    // Line art: give the SVG the paper it was drawn on.
+    const paper = inkMeanLuma >= 128 ? "#ffffff" : "#000000";
+    svg = svg.replace(
+      /(<svg\b[^>]*>)/,
+      `$1<rect width="100%" height="100%" fill="${paper}"/>`,
+    );
+  }
   if (!svg.endsWith("\n")) svg += "\n";
 
   return {

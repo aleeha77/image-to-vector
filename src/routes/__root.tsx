@@ -8,7 +8,8 @@ export const Route = createRootRoute({
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "My site" },
+      { title: "Tracecraft — image to SVG vector converter" },
+      { name: "description", content: "Turn any raster image into a clean, editable SVG. Colour separation and curve fitting, tuned for logos, line art, photos and busy textiles like dress prints." },
     ],
     links: [{ rel: "stylesheet", href: appCss }],
   }),
