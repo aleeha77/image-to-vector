@@ -1,40 +1,24 @@
 /**
  * Tracecraft tracing engine (server-only).
  *
- * Raster -> SVG via vtracer (the Rust `visioncortex` vectoriser) through the
- * `@neplex/vectorizer` napi bindings, with a sharp preprocessing stage in front.
- * Colour separation comes from vtracer's hierarchical colour clustering; the
- * preprocessing stage is where most of the perceived quality is won or lost, so
- * every preset bakes its own pipeline (upscale / denoise / colour shaping).
+ * Raster -> SVG through the sub-pixel tracer in `./trace-core.server`: every
+ * upload is preprocessed into either a set of flat colour regions or a 1-bit ink
+ * mask, and each region is then contoured as a *coverage level set* (so vertices
+ * are sub-pixel accurate and carry no pixel staircase) and fitted with real cubic
+ * Béziers between detected corners.
+ *
+ * The old engine handed a deliberately downscaled bitmap to a tracer that followed
+ * pixel boundaries, so its geometry *was* the raster's grid — hence output that
+ * pixelated as soon as you zoomed. The preprocessing here exists only to make the
+ * regions the tracer contours correct and flat; the geometry no longer inherits
+ * the raster's resolution.
  *
  * Everything happens in memory buffers — an uploaded image is never written to
  * disk, stored, or logged.
  */
-import { optimize, vectorizeRaw } from "@neplex/vectorizer";
 import sharp from "sharp";
-import { quantise } from "./quantise";
-
-// `@neplex/vectorizer` exposes its enums as plain i32s at runtime (the TS
-// `declare enum`s are erased), so these constants are the ABI, not a style choice.
-const COLOR_MODE: Record<"color" | "binary", number> = { color: 0, binary: 1 };
-const HIERARCHICAL: Record<"stacked" | "cutout", number> = { stacked: 0, cutout: 1 };
-const SIMPLIFY: Record<"none" | "polygon" | "spline", number> = { none: 0, polygon: 1, spline: 2 };
-const OPTIMIZE_PRESET_SAFE = 1;
-
-/** The shape the napi binding actually accepts. */
-interface NativeConfig {
-  colorMode: number;
-  hierarchical: number;
-  filterSpeckle: number;
-  colorPrecision: number;
-  layerDifference: number;
-  mode: number;
-  cornerThreshold: number;
-  lengthThreshold: number;
-  maxIterations: number;
-  spliceThreshold: number;
-  pathPrecision: number;
-}
+import { quantiseLabels } from "./quantise";
+import { contoursForMask, hex, labelStats, type CoreOptions, type Contoured } from "./trace-core.server";
 
 export const PRESET_IDS = ["logo", "lineart", "photo", "pattern"] as const;
 export type PresetId = (typeof PRESET_IDS)[number];
@@ -58,7 +42,7 @@ export interface TraceResult {
   svg: string;
   width: number;
   height: number;
-  /** Number of <path> elements — the honest "how much vector detail" measure. */
+  /** Distinct contours drawn — the honest "how much vector detail" measure. */
   pathCount: number;
   /** Distinct fill colours — evidence that colour separation actually happened. */
   colourCount: number;
@@ -71,9 +55,11 @@ export interface TraceResult {
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
+/** Contours = one `M` per closed subpath inside the emitted path data. */
 export function countPaths(svg: string): number {
-  const m = svg.match(/<path\b/g);
-  return m ? m.length : 0;
+  let n = 0;
+  for (const d of svg.matchAll(/ d="([^"]*)"/g)) n += (d[1].match(/M/g) ?? []).length;
+  return n || (svg.match(/<path\b/g) ?? []).length;
 }
 
 export function countColours(svg: string): number {
@@ -86,199 +72,150 @@ export function countColours(svg: string): number {
 }
 
 /**
- * Per-preset tuning. `detail` interpolates each knob between its `hi` (detail 1)
- * and `lo` (detail 0) value: more detail means less speckle filtering (small
- * shapes survive), finer colour precision (more distinct colours) and a smaller
- * layer difference (more colour layers are kept apart).
+ * Per-preset tuning.
+ *
+ * `sigma` is the coverage-field smoothing in working pixels: it is what turns a
+ * pixel-boundary silhouette into a continuous level set, and it is deliberately
+ * well under a pixel so that hairlines and corners survive.
+ *
+ * `fitError` is the maximum deviation the Bézier fit is allowed, in working
+ * pixels — the whole point of a sub-pixel tracer is that this can be tight.
+ *
+ * `minArea` (px²) drops noise specks; it stays tiny so genuine dots and 1px
+ * hairlines are traced rather than filtered away.
  */
 interface PresetTuning {
-  colorMode: "color" | "binary";
-  hierarchical: "stacked" | "cutout";
-  /** [at detail 1, at detail 0] */
-  speckle: [number, number];
-  precision: [number, number];
-  layers: [number, number];
-  cornerThreshold: number;
-  lengthThreshold: number;
-  spliceThreshold: number;
-  pathPrecision: number;
-  /** Max edge length handed to the vectoriser (time/memory guard). */
+  mode: "binary" | "color";
+  /** [at detail 1, at detail 0] palette size for colour presets. */
+  colours: [number, number];
+  /** [at detail 1, at detail 0] curve-fit tolerance, working px. */
+  fitError: [number, number];
+  /** [at detail 1, at detail 0] minimum contour area, px². */
+  minArea: [number, number];
+  /** Coverage-field smoothing, working px. */
+  sigma: number;
+  /** Turn angle (degrees) that counts as a corner. */
+  cornerAngle: number;
+  /** Longest edge handed to the tracer (time/memory guard). */
   maxDim: number;
-  /** Smaller inputs are upscaled to this edge — curve fitting needs pixels. */
+  /** Smaller inputs are upscaled to this edge so thin features keep sub-pixel room. */
   minDim: number;
   /** Median denoise window (1 = off). Kills sensor / print / compression speckle. */
-  median: number;
-  /** Pre-blur sigma; merges neighbouring shades so photos yield cleaner layers. */
+  denoise: number;
+  /** Pre-blur sigma; merges neighbouring shades so photos yield cleaner regions. */
   blur: number;
   /** 1 = untouched; >1 widens the gaps between neighbouring colour clusters. */
   saturation: number;
-  /** Line art only: luminance cut for the 1-bit input mask. */
-  threshold?: number;
-  /**
-   * Quantise to this many colours (libimagequant through sharp) before tracing.
-   * This is the single biggest quality lever on textiles and photos: it removes
-   * print/sensor grain and forces genuinely flat, separable colour regions, so
-   * the vectoriser clusters real shapes instead of noise. 0 = off.
-   */
-  palette: number;
-  /** Palette dither amount: 0 keeps flat regions flat, 1 helps photo gradients. */
-  dither: number;
+  /** Line art only: luminance cut for the ink mask. */
+  threshold: number;
 }
 
 export const TUNING: Record<PresetId, PresetTuning> = {
-  // Flat art, few colours, hard edges. Aggressive clustering, so photo-ish noise
-  // in a logo upload collapses into clean flat shapes instead of confetti.
+  // Flat art, few colours, hard edges. Fine field, tight fit: corners and
+  // straight edges have to stay dead straight.
   logo: {
-    colorMode: "color",
-    hierarchical: "cutout",
-    speckle: [3, 12],
-    precision: [7, 4],
-    layers: [10, 28],
-    cornerThreshold: 60,
-    lengthThreshold: 3.6,
-    spliceThreshold: 45,
-    pathPrecision: 2,
-    maxDim: 1600,
-    minDim: 900,
-    median: 3,
-    blur: 0,
-    saturation: 1.05,
-    palette: 0,
-    dither: 0,
-  },
-  // Ink / pencil drawings: auto-levelled, denoised, hard-thresholded to a 1-bit
-  // mask, then spline-traced. Far more predictable than letting the vectoriser
-  // pick its own threshold on a photograph of paper.
-  lineart: {
-    colorMode: "binary",
-    hierarchical: "stacked",
-    speckle: [2, 6],
-    precision: [8, 8],
-    layers: [16, 16],
-    cornerThreshold: 60,
-    lengthThreshold: 4,
-    spliceThreshold: 45,
-    pathPrecision: 3,
-    maxDim: 2200,
-    minDim: 1100,
-    median: 3,
+    mode: "color",
+    colours: [24, 8],
+    fitError: [0.32, 0.5],
+    minArea: [1, 6],
+    sigma: 0.7,
+    cornerAngle: 30,
+    maxDim: 2400,
+    minDim: 700,
+    denoise: 1,
     blur: 0,
     saturation: 1,
     threshold: 140,
-    palette: 0,
-    dither: 0,
   },
-  // Photographs: many subtle shades. Blur first so neighbouring clusters merge,
-  // cutout layering so the result is not a stack of overlapping translucent
-  // blobs, and a smaller working size because photos explode into paths.
-  photo: {
-    colorMode: "color",
-    hierarchical: "cutout",
-    speckle: [4, 24],
-    precision: [8, 5],
-    layers: [20, 72],
-    cornerThreshold: 60,
-    lengthThreshold: 4,
-    spliceThreshold: 45,
-    pathPrecision: 2,
-    maxDim: 1100,
-    minDim: 800,
-    median: 3,
-    blur: 0.7,
-    saturation: 1.04,
-    palette: 0,
-    dither: 0,
-  },
-  // Textiles, dress prints, wallpaper: dense mid-size motifs, dozens of colours,
-  // fine dots and hairlines. Speckle filtering stays low so the dots survive,
-  // colour precision stays high, and the input is upscaled so thin lines have
-  // real pixels to fit curves to.
-  pattern: {
-    colorMode: "color",
-    hierarchical: "cutout",
-    speckle: [1, 8],
-    precision: [8, 5],
-    layers: [12, 32],
-    cornerThreshold: 60,
-    lengthThreshold: 3.2,
-    spliceThreshold: 45,
-    pathPrecision: 2,
-    maxDim: 1700,
-    minDim: 1200,
-    median: 5,
+  // Ink / pencil drawings: auto-levelled, denoised, cut to an ink mask, then
+  // traced as a single ink layer over its own paper colour.
+  lineart: {
+    mode: "binary",
+    colours: [2, 2],
+    fitError: [0.28, 0.45],
+    minArea: [0.6, 3],
+    sigma: 0.6,
+    cornerAngle: 34,
+    maxDim: 2600,
+    minDim: 900,
+    denoise: 3,
     blur: 0,
-    saturation: 1.12,
-    palette: 0,
-    dither: 0,
+    saturation: 1,
+    threshold: 140,
+  },
+  // Photographs: many subtle shades. More smoothing (grain must not become
+  // geometry), fewer, larger regions, and a looser fit because the "edges" are
+  // gradients rather than lines.
+  photo: {
+    mode: "color",
+    colours: [40, 12],
+    fitError: [0.5, 0.9],
+    minArea: [2, 14],
+    sigma: 0.9,
+    cornerAngle: 38,
+    maxDim: 1600,
+    minDim: 600,
+    denoise: 3,
+    blur: 0.4,
+    saturation: 1.03,
+    threshold: 140,
+  },
+  // Textiles, dress prints, wallpaper: dense motifs, hairlines, fine dots.
+  // Small sigma and small minArea so dots and 1px lines survive.
+  pattern: {
+    mode: "color",
+    colours: [32, 10],
+    fitError: [0.3, 0.55],
+    minArea: [0.8, 6],
+    sigma: 0.6,
+    cornerAngle: 32,
+    maxDim: 2200,
+    minDim: 900,
+    denoise: 1,
+    blur: 0,
+    saturation: 1.06,
+    threshold: 140,
   },
 };
 
-export function buildConfig(preset: PresetId, detail: number): NativeConfig {
+export function coreOptions(preset: PresetId, detail: number): CoreOptions {
   const t = TUNING[preset];
   const d = clamp(detail, 0, 1);
   return {
-    colorMode: COLOR_MODE[t.colorMode],
-    hierarchical: HIERARCHICAL[t.hierarchical],
-    filterSpeckle: Math.round(lerp(t.speckle[0], t.speckle[1], d)),
-    colorPrecision: Math.round(lerp(t.precision[0], t.precision[1], d)),
-    layerDifference: Math.round(lerp(t.layers[0], t.layers[1], d)),
-    mode: SIMPLIFY.spline,
-    cornerThreshold: t.cornerThreshold,
-    lengthThreshold: t.lengthThreshold,
-    maxIterations: 10,
-    spliceThreshold: t.spliceThreshold,
-    pathPrecision: t.pathPrecision,
+    sigma: t.sigma,
+    fitError: lerp(t.fitError[0], t.fitError[1], d),
+    cornerAngle: t.cornerAngle,
+    minArea: lerp(t.minArea[0], t.minArea[1], d),
+    precision: 3,
   };
 }
 
-/**
- * Pad/expand any raw sharp buffer to the 4-channel RGBA the napi binding requires.
- * sharp hands back 1 channel after `threshold()` and 3 after a paletted PNG, so a
- * fixed call to `ensureAlpha()` is not enough (it is not honoured on 1-bit data).
- */
-function asRgba(data: Buffer, channels: number): Buffer {
-  if (channels === 4) return data;
-  const pixels = data.length / channels;
-  const out = Buffer.alloc(pixels * 4);
-  if (channels === 1) {
-    for (let i = 0, o = 0; i < pixels; i++, o += 4) {
-      const v = data[i];
-      out[o] = v;
-      out[o + 1] = v;
-      out[o + 2] = v;
-      out[o + 3] = 255;
-    }
-  } else {
-    for (let i = 0, o = 0, s = 0; i < pixels; i++, o += 4, s += channels) {
+/** RGB bytes out of whatever channel count sharp handed back. */
+function toRgb(data: Buffer, channels: number, pixels: number): Buffer {
+  if (channels === 3) return data;
+  const out = Buffer.alloc(pixels * 3);
+  if (channels === 4) {
+    for (let i = 0, s = 0, o = 0; i < pixels; i++, s += 4, o += 3) {
       out[o] = data[s];
       out[o + 1] = data[s + 1];
       out[o + 2] = data[s + 2];
-      out[o + 3] = 255;
     }
+    return out;
+  }
+  for (let i = 0, o = 0; i < pixels; i++, o += 3) {
+    out[o] = data[i];
+    out[o + 1] = data[i];
+    out[o + 2] = data[i];
   }
   return out;
 }
 
-/**
- * Rebuild the opening <svg> tag with a known-good header: vtracer's own tag has
- * a version attribute but no viewBox, so the output would not scale.
- */
-function normaliseSvgHeader(svg: string, width: number, height: number): string {
-  const open = svg.match(/<svg\b[^>]*>/);
-  if (!open || open.index === undefined) return svg;
-  const extra = open[0]
-    .slice(4, -1)
-    .replace(/\s(?:width|height|viewBox|xmlns|version|baseProfile)="[^"]*"/g, "")
-    .trim();
-  const header =
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" ` +
-    `viewBox="0 0 ${width} ${height}"${extra ? ` ${extra}` : ""}>`;
-  const body = svg
-    .slice(open.index + open[0].length)
-    .replace(/<\?xml[^>]*\?>/g, "")
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .trim();
-  return header + body;
+interface Layer {
+  d: string;
+  colour: [number, number, number];
+  area: number;
+  contours: number;
+  curves: number;
 }
 
 /**
@@ -286,9 +223,7 @@ function normaliseSvgHeader(svg: string, width: number, height: number): string 
  */
 export async function traceImage(input: Buffer, options: TraceOptions): Promise<TraceResult> {
   const started = Date.now();
-  const preset: PresetId = (PRESET_IDS as readonly string[]).includes(options.preset)
-    ? options.preset
-    : "logo";
+  const preset: PresetId = (PRESET_IDS as readonly string[]).includes(options.preset) ? options.preset : "logo";
   const t = TUNING[preset];
   const detail = clamp(options.detail ?? 0.5, 0, 1);
   const background = options.background ?? "#ffffff";
@@ -300,7 +235,9 @@ export async function traceImage(input: Buffer, options: TraceOptions): Promise<
   if (!meta.width || !meta.height) throw new Error("Unreadable image data");
   if (meta.hasAlpha) steps.push(`transparency flattened onto ${background}`);
 
-  // Upscale small inputs (curve fitting needs pixels), cap big ones (time/memory).
+  // Working resolution. Upscaling a small input is not a trick to hide pixel
+  // edges: the contour is sub-pixel either way, but a wider feature gives the
+  // smoothing kernel proportionally less bite, so 1px hairlines keep their width.
   const longEdge = Math.max(meta.width, meta.height);
   const target = clamp(longEdge, t.minDim, t.maxDim);
   if (target !== longEdge) {
@@ -312,23 +249,77 @@ export async function traceImage(input: Buffer, options: TraceOptions): Promise<
     });
     steps.push(
       longEdge < target
-        ? `upscaled ${String(meta.width)}×${String(meta.height)} for curve fitting`
-        : `downscaled ${String(meta.width)}×${String(meta.height)} to keep the trace crisp`,
+        ? `upscaled ${String(meta.width)}×${String(meta.height)} so hairlines keep sub-pixel room`
+        : `working resolution ${String(Math.round((meta.width * target) / longEdge))}×${String(Math.round((meta.height * target) / longEdge))}`,
     );
   }
 
-  if (preset === "lineart") {
-    // Detail raises the cut a little: a higher threshold keeps fainter strokes.
-    const cut = clamp((t.threshold ?? 128) + (detail - 0.5) * 40, 60, 220);
+  const core = coreOptions(preset, detail);
+  const layers: Layer[] = [];
+  let width = meta.width;
+  let height = meta.height;
+  let paper = "#ffffff";
+  let ink = "#000000";
+
+  if (t.mode === "binary") {
+    const cut = clamp(t.threshold + (detail - 0.5) * 40, 40, 236);
     pipeline = pipeline.grayscale().normalise();
-    if (t.median > 1) pipeline = pipeline.median(t.median);
-    pipeline = pipeline.threshold(cut);
-    steps.push(`auto-levelled, despeckled, 1-bit at luminance ${String(Math.round(cut))}`);
+    if (t.denoise > 1) pipeline = pipeline.median(t.denoise);
+    const { data, info } = await pipeline.raw().toBuffer({ resolveWithObject: true });
+    width = info.width;
+    height = info.height;
+    const pixels = width * height;
+    const mask = new Uint8Array(pixels);
+    let mean = 0;
+    for (let i = 0; i < pixels; i++) mean += data[i];
+    mean /= pixels;
+    // Ink is the minority tone: dark ink on paper, or light chalk on a board.
+    const darkIsInk = mean >= 128;
+    let inkR = 0;
+    let inkG = 0;
+    let inkB = 0;
+    let inkN = 0;
+    let paperR = 0;
+    let paperG = 0;
+    let paperB = 0;
+    let paperN = 0;
+    const rgb = toRgb(data, info.channels, pixels);
+    for (let i = 0, p = 0; i < pixels; i++, p += 3) {
+      const v = data[i];
+      const isInk = darkIsInk ? v < cut : v > cut;
+      mask[i] = isInk ? 1 : 0;
+      if (isInk) {
+        inkR += rgb[p];
+        inkG += rgb[p + 1];
+        inkB += rgb[p + 2];
+        inkN++;
+      } else {
+        paperR += rgb[p];
+        paperG += rgb[p + 1];
+        paperB += rgb[p + 2];
+        paperN++;
+      }
+    }
+    if (inkN > 0) ink = hex([inkR / inkN, inkG / inkN, inkB / inkN]);
+    if (paperN > 0) paper = hex([paperR / paperN, paperG / paperN, paperB / paperN]);
+    steps.push(`auto-levelled, denoised, 1-bit ink mask at luminance ${String(Math.round(cut))}`);
+    if (inkN === 0 || paperN === 0) {
+      // Nothing to separate — emit a single flat rectangle.
+      const only = inkN === 0 ? paper : ink;
+      const svg = wrapSvg(
+        width,
+        height,
+        `<rect width="${String(width)}" height="${String(height)}" fill="${only}"/>`,
+      );
+      return finish(svg, Date.now() - started, steps);
+    }
+    const contoured = contoursForMask(mask, width, height, [0, 0, width - 1, height - 1], core);
+    layers.push(collect(contoured, rgbOf(ink)));
   } else {
     pipeline = pipeline.flatten({ background }).toColourspace("srgb");
-    if (t.median > 1) {
-      pipeline = pipeline.median(t.median);
-      steps.push(`despeckled (median ${String(t.median)})`);
+    if (t.denoise > 1) {
+      pipeline = pipeline.median(t.denoise);
+      steps.push(`despeckled (median ${String(t.denoise)})`);
     }
     if (t.blur > 0) {
       pipeline = pipeline.blur(t.blur);
@@ -338,60 +329,90 @@ export async function traceImage(input: Buffer, options: TraceOptions): Promise<
       pipeline = pipeline.modulate({ saturation: t.saturation });
       steps.push(`colour separation widened (saturation ×${t.saturation.toFixed(2)})`);
     }
-    if (t.palette > 0) {
-      // Handled after the raw decode below — the quantiser works on pixels.
-      steps.push(`quantised to ${String(t.palette)} flat colours (median cut)`);
+    const { data, info } = await pipeline.raw().toBuffer({ resolveWithObject: true });
+    width = info.width;
+    height = info.height;
+    const pixels = width * height;
+    const wanted = Math.round(lerp(t.colours[0], t.colours[1], detail));
+    const rgb = toRgb(data, info.channels, pixels);
+    const { labels, palette } = quantiseLabels(rgb, 3, width, height, wanted);
+    steps.push(`quantised to ${String(palette.length)} flat colours (median cut)`);
+    const stats = labelStats(labels, width, height, palette.length);
+    const order = stats
+      .map((s, i) => ({ i, pixels: s.pixels, bbox: s.bbox }))
+      .filter((s) => s.pixels > 0)
+      .sort((a, b) => b.pixels - a.pixels);
+    const mask = new Uint8Array(pixels);
+    let prev: [number, number, number, number] | null = null;
+    for (const s of order) {
+      // Only the previous layer's bounding box needs clearing, and only this
+      // layer's box needs setting: cheap even with 40 layers.
+      if (prev) {
+        for (let y = prev[1]; y <= prev[3]; y++) mask.fill(0, y * width + prev[0], y * width + prev[2] + 1);
+      }
+      for (let y = s.bbox[1]; y <= s.bbox[3]; y++) {
+        const row = y * width;
+        for (let x = s.bbox[0]; x <= s.bbox[2]; x++) if (labels[row + x] === s.i) mask[row + x] = 1;
+      }
+      prev = s.bbox;
+      const contoured = contoursForMask(mask, width, height, s.bbox, core);
+      if (!contoured.length) continue;
+      const packed = palette[s.i];
+      layers.push(collect(contoured, [(packed >> 16) & 255, (packed >> 8) & 255, packed & 255]));
     }
+    steps.push(`traced ${String(layers.length)} colour layers`);
   }
 
-  const { data, info } = await pipeline.raw().toBuffer({ resolveWithObject: true });
-  let rgba = asRgba(data, info.channels);
-  let inkMeanLuma = -1;
-  if (preset === "lineart") {
-    // The 1-bit mask is almost always dark ink on light paper; remember which way
-    // round it is so the exported SVG carries its own background rather than
-    // relying on whatever the viewer puts behind it.
-    let sum = 0;
-    for (let i = 0; i < rgba.length; i += 4) sum += rgba[i];
-    inkMeanLuma = sum / (rgba.length / 4);
-  } else if (t.palette > 0 && t.palette < 256) {
-    rgba = quantise(rgba, 4, info.width, info.height, t.palette).rgba;
-  }
-  const config = buildConfig(preset, detail);
+  // Largest layer first: each layer is an opaque, self-contained shape, so
+  // painting them biggest-first stacks correctly (holes are winding-cut inside
+  // each layer, so whatever is underneath shows through).
+  const body = layers
+    .map((l) => `<path fill="${hex(l.colour)}" d="${l.d}"/>`)
+    .join("");
+  const rect = t.mode === "binary" ? `<rect width="${String(width)}" height="${String(height)}" fill="${paper}"/>` : "";
+  const svg = wrapSvg(width, height, rect + body);
+
+  const curves = layers.reduce((s, l) => s + l.curves, 0);
   steps.push(
-    `traced ${String(info.width)}×${String(info.height)} · ${String(config.filterSpeckle)}px speckle` +
-      ` · ${String(config.colorPrecision)}-bit colour · ${String(config.layerDifference)} layer delta`,
+    `sub-pixel contours: ${String(layers.reduce((s, l) => s + l.contours, 0))} shapes, ${String(curves)} cubic curves, field \u03c3 ${String(core.sigma)}px, fit \u00b1${core.fitError.toFixed(2)}px`,
   );
+  return finish(svg, Date.now() - started, steps);
+}
 
-  const raw = await vectorizeRaw(rgba, { width: info.width, height: info.height }, config);
+function rgbOf(colour: string): [number, number, number] {
+  const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(colour.trim());
+  if (!m) return [0, 0, 0];
+  return [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)];
+}
 
-  // Optimise (mostly colour/spacing shortening) for a smaller download. A failure
-  // here is never allowed to cost the visitor their trace.
-  let svg = raw;
-  try {
-    svg = await optimize(raw, { preset: OPTIMIZE_PRESET_SAFE, multipass: true });
-  } catch {
-    svg = raw;
-  }
-  svg = normaliseSvgHeader(svg, info.width, info.height);
-  if (inkMeanLuma >= 0) {
-    // Line art: give the SVG the paper it was drawn on.
-    const paper = inkMeanLuma >= 128 ? "#ffffff" : "#000000";
-    svg = svg.replace(
-      /(<svg\b[^>]*>)/,
-      `$1<rect width="100%" height="100%" fill="${paper}"/>`,
-    );
-  }
-  if (!svg.endsWith("\n")) svg += "\n";
+function collect(contoured: Contoured[], colour: [number, number, number]): Layer {
+  return {
+    d: contoured.map((c) => c.d).join(""),
+    colour,
+    area: contoured.reduce((s, c) => s + c.area, 0),
+    contours: contoured.length,
+    curves: contoured.reduce((s, c) => s + c.curves, 0),
+  };
+}
 
+/** A self-describing, scalable SVG: explicit size, matching viewBox, no bitmaps. */
+function wrapSvg(width: number, height: number, body: string): string {
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${String(width)}" height="${String(height)}" ` +
+    `viewBox="0 0 ${String(width)} ${String(height)}">${body}</svg>\n`
+  );
+}
+
+function finish(svg: string, ms: number, steps: string[]): TraceResult {
+  const dims = /width="(\d+)" height="(\d+)"/.exec(svg);
   return {
     svg,
-    width: info.width,
-    height: info.height,
+    width: Number(dims?.[1] ?? 0),
+    height: Number(dims?.[2] ?? 0),
     pathCount: countPaths(svg),
     colourCount: countColours(svg),
     bytes: Buffer.byteLength(svg, "utf8"),
-    ms: Date.now() - started,
+    ms,
     steps,
   };
 }

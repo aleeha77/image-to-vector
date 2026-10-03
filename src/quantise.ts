@@ -69,7 +69,50 @@ export function quantise(
   height: number,
   colours: number,
 ): QuantiseResult {
+  const { lut, palette } = quantiseLut(data, channels, width * height, colours);
+  return { rgba: mapTo(data, channels, width * height, lut, palette), palette };
+}
+
+export interface LabelResult {
+  /** Palette index per pixel, row-major. */
+  labels: Uint16Array;
+  /** The palette actually used (packed 0xRRGGBB). */
+  palette: number[];
+}
+
+/**
+ * Same quantisation, but returning the *label map* the tracer works from: one
+ * flat colour index per pixel. Kept alongside `quantise` so both share a single
+ * implementation of the median cut.
+ */
+export function quantiseLabels(
+  data: Buffer,
+  channels: number,
+  width: number,
+  height: number,
+  colours: number,
+): LabelResult {
   const pixels = width * height;
+  const { lut, palette } = quantiseLut(data, channels, pixels, colours);
+  const labels = new Uint16Array(pixels);
+  for (let i = 0, p = 0; i < pixels; i++, p += channels) {
+    const r = data[p];
+    const g = channels === 1 ? r : data[p + 1];
+    const b = channels === 1 ? r : data[p + 2];
+    const bin = ((r >> (8 - BITS)) << (BITS * 2)) | ((g >> (8 - BITS)) << BITS) | (b >> (8 - BITS));
+    const idx = lut[bin];
+    labels[i] = idx < 0 ? 0 : idx;
+  }
+  return { labels, palette };
+}
+
+/** Median cut over a 5-bit histogram: the shared engine of both exports. */
+function quantiseLut(
+  data: Buffer,
+  channels: number,
+  pixels: number,
+  colours: number,
+): { lut: Int16Array; palette: number[] } {
   const maxColours = Math.max(2, Math.min(256, Math.floor(colours)));
 
   // 1. Histogram (weighted sums avoid a second pass over the image).
@@ -103,7 +146,7 @@ export function quantise(
           Math.round(sumB[bin] / hist[bin]),
       );
     }
-    return { rgba: mapTo(data, channels, pixels, lut, palette), palette };
+    return { lut, palette };
   }
 
   // 2. Median cut: repeatedly split the widest/most-populated box at its
@@ -193,7 +236,7 @@ export function quantise(
     lut[bin] = best;
   }
 
-  return { rgba: mapTo(data, channels, pixels, lut, palette), palette };
+  return { lut, palette };
 }
 
 /** Write every pixel as the flat palette colour of its histogram bin. */
