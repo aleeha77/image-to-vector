@@ -383,9 +383,16 @@ function marchingSquares(
         }
         case 10: {
           const mean = (v0 + v1 + v2 + v3) / 4;
+          // v0 and v2 inside. Mostly inside => pinch the *outside* corners off
+          // (top-right, bottom-left) with top->right and bottom->left. This is
+          // the exact complement of case 5's mean<ISO pairing, which is what
+          // makes every crossing node have one successor and one predecessor:
+          // pairing it the other way round leaves nodes with two predecessors
+          // and none, so the chained ring hits a dead end, is dropped or left
+          // open, and the region's interior goes unpainted.
           if (mean >= ISO) {
-            succ.set(left, top);
-            succ.set(right, bottom);
+            succ.set(top, right);
+            succ.set(bottom, left);
           } else {
             succ.set(top, left);
             succ.set(bottom, right);
