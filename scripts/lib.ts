@@ -156,6 +156,119 @@ export interface FitScore {
 }
 
 /**
+ * How far an outline departs from a perfect circle, in source px.
+ *
+ * This is the "lumpy curve" detector. Direction smoothness (the staircase test)
+ * and curvature smoothness are different things: a contour can be perfectly
+ * continuous and still wobble in curvature at a scale far above the pixel grid.
+ * Fitting a circle to the outline pixels near a known circular stroke and
+ * reporting the radial residual measures exactly that, and the same number can
+ * be read off the ground truth and the raster as a floor.
+ */
+export interface RadialScore {
+  rmsPx: number;
+  p95Px: number;
+  /** Radius of the fitted circle, source px — sanity check that it found the stroke. */
+  radiusPx: number;
+  points: number;
+}
+
+export function radialResidual(
+  img: Raw,
+  box: Box,
+  spec: { cx: number; cy: number; r: number; band: number },
+  zoom: number,
+  threshold = 160,
+): RadialScore | null {
+  const t = crop(img, box);
+  const m = inkMask(t, threshold);
+  const b = boundary(m, t.width, t.height);
+  const rd = spec.r * zoom;
+  const band = spec.band * zoom;
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (let y = 0; y < t.height; y++) {
+    for (let x = 0; x < t.width; x++) {
+      if (!b[y * t.width + x]) continue;
+      const dx = box.x + x + 0.5 - spec.cx * zoom;
+      const dy = box.y + y + 0.5 - spec.cy * zoom;
+      const d = Math.hypot(dx, dy);
+      if (Math.abs(d - rd) > band) continue;
+      xs.push(dx);
+      ys.push(dy);
+    }
+  }
+  if (xs.length < 24) return null;
+  // Kasa algebraic circle fit: linear least squares on (x²+y²) = 2ax + 2by + c.
+  let sx = 0;
+  let sy = 0;
+  let sxx = 0;
+  let syy = 0;
+  let sxy = 0;
+  let sz = 0;
+  let sxz = 0;
+  let syz = 0;
+  const n = xs.length;
+  for (let i = 0; i < n; i++) {
+    const x = xs[i];
+    const y = ys[i];
+    const z = x * x + y * y;
+    sx += x;
+    sy += y;
+    sxx += x * x;
+    syy += y * y;
+    sxy += x * y;
+    sz += z;
+    sxz += x * z;
+    syz += y * z;
+  }
+  const m1 = [
+    [sxx, sxy, sx],
+    [sxy, syy, sy],
+    [sx, sy, n],
+  ];
+  const v1 = [sxz, syz, sz];
+  const sol = solve3(m1, v1);
+  if (!sol) return null;
+  const [a, b2, c] = sol;
+  const cx = a / 2;
+  const cy = b2 / 2;
+  const r = Math.sqrt(Math.max(0, c + cx * cx + cy * cy));
+  const resid: number[] = [];
+  for (let i = 0; i < n; i++) resid.push(Math.abs(Math.hypot(xs[i] - cx, ys[i] - cy) - r));
+  resid.sort((p, q) => p - q);
+  const rms = Math.sqrt(resid.reduce((s, v) => s + v * v, 0) / n);
+  return {
+    rmsPx: rms / zoom,
+    p95Px: resid[Math.floor(n * 0.95)] / zoom,
+    radiusPx: r / zoom,
+    points: n,
+  };
+}
+
+function solve3(m: number[][], v: number[]): [number, number, number] | null {
+  const a = m.map((row, i) => [...row, v[i]]);
+  for (let i = 0; i < 3; i++) {
+    let p = i;
+    for (let j = i + 1; j < 3; j++) if (Math.abs(a[j][i]) > Math.abs(a[p][i])) p = j;
+    if (Math.abs(a[p][i]) < 1e-12) return null;
+    [a[i], a[p]] = [a[p], a[i]];
+    for (let j = i + 1; j < 3; j++) {
+      const f = a[j][i] / a[i][i];
+      for (let k = i; k < 4; k++) a[j][k] -= f * a[i][k];
+    }
+  }
+  const out: number[] = [0, 0, 0];
+  for (let i = 2; i >= 0; i--) {
+    let s = a[i][3];
+    for (let k = i + 1; k < 3; k++) s -= a[i][k] * out[k];
+    out[i] = s / a[i][i];
+  }
+  return [out[0], out[1], out[2]];
+}
+
+
+/**
  * Compare a traced render against a ground-truth render, both already at the same
  * device scale, restricted to `box` (device px).
  */

@@ -115,6 +115,156 @@ function fieldFromMask(
   return { field: out, fw, fh };
 }
 
+/**
+ * Smooth a field with the same Gaussian, zero-padded at the rectangle's edge.
+ * Because every rectangle passed in is a region's bounding box plus a margin
+ * wider than the kernel, the padding only ever lands where the region is absent
+ * — including outside the image, which is what closes a region that runs off
+ * the canvas exactly at the canvas edge.
+ */
+export function smoothField(field: Float32Array, fw: number, fh: number, sigma: number): Float32Array {
+  const k = gaussianKernel(sigma);
+  const r = (k.length - 1) / 2;
+  const tmp = new Float32Array(fw * fh);
+  const out = new Float32Array(fw * fh);
+  for (let fy = 0; fy < fh; fy++) {
+    const row = fy * fw;
+    for (let fx = 0; fx < fw; fx++) {
+      let acc = 0;
+      for (let i = -r; i <= r; i++) {
+        const px = fx + i;
+        if (px < 0 || px >= fw) continue;
+        acc += k[i + r] * field[row + px];
+      }
+      tmp[row + fx] = acc;
+    }
+  }
+  for (let fy = 0; fy < fh; fy++) {
+    for (let fx = 0; fx < fw; fx++) {
+      let acc = 0;
+      for (let i = -r; i <= r; i++) {
+        const py = fy + i;
+        if (py < 0 || py >= fh) continue;
+        acc += k[i + r] * tmp[py * fw + fx];
+      }
+      out[fy * fw + fx] = acc;
+    }
+  }
+  return out;
+}
+
+export interface Coverage {
+  /** Fraction of the pixel its own region covers (1 = the pixel is only its own region). */
+  own: Float32Array;
+  /** Region the pixel partly belongs to (its strongest mix), or -1 for none. */
+  mixTo: Int32Array;
+  /** How much of the pixel belongs to `mixTo`, in [0, 1]. */
+  mix: Float32Array;
+}
+
+/**
+ * Coverage per pixel, from *colour unmixing*.
+ *
+ * A pixel on the boundary between regions A and B has a colour that is a mix of
+ * the two, and the mix fraction is the pixel's sub-pixel coverage of each. So
+ * for a pixel in region A with colour C and a neighbouring region B:
+ *
+ *     t = <C - A, B - A> / |B - A|^2      (clamped to [0, 1])
+ *
+ * is how much of the pixel is B. This is what makes the contour sub-pixel: a
+ * 50%-covered boundary pixel contributes 0.5 to the field, so the iso-0.5 level
+ * set runs through its *centre* rather than through the pixel grid line next to
+ * it. Snapping such a pixel to one side or the other is exactly what produced a
+ * half-pixel wobble along curves, and it is also why a hairline used to break
+ * up: unmixing keeps its true sub-pixel width instead of a thresholded 1px step.
+ */
+export function layerCoverage(
+  labels: Uint16Array,
+  palette: number[],
+  rgb: Buffer,
+  channels: number,
+  w: number,
+  h: number,
+): Coverage {
+  const n = w * h;
+  const own = new Float32Array(n);
+  const mixTo = new Int32Array(n).fill(-1);
+  const mix = new Float32Array(n);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      const l = labels[i];
+      const p = i * channels;
+      const cr = rgb[p];
+      const cg = rgb[p + 1];
+      const cb = rgb[p + 2];
+      const packed = palette[l] ?? 0;
+      const ar = (packed >> 16) & 255;
+      const ag = (packed >> 8) & 255;
+      const ab = packed & 255;
+      let best = 0;
+      let bestLabel = -1;
+      for (let d = 0; d < 4; d++) {
+        const q = d === 0 ? (x > 0 ? i - 1 : -1) : d === 1 ? (x < w - 1 ? i + 1 : -1) : d === 2 ? (y > 0 ? i - w : -1) : y < h - 1 ? i + w : -1;
+        if (q < 0) continue;
+        const lq = labels[q];
+        if (lq === l) continue;
+        const packedQ = palette[lq] ?? 0;
+        const br = (packedQ >> 16) & 255;
+        const bg = (packedQ >> 8) & 255;
+        const bb = packedQ & 255;
+        const dx = br - ar;
+        const dy = bg - ag;
+        const dz = bb - ab;
+        const len2 = dx * dx + dy * dy + dz * dz;
+        if (len2 < 9) continue;
+        const t = ((cr - ar) * dx + (cg - ag) * dy + (cb - ab) * dz) / len2;
+        if (t > best) {
+          best = t;
+          bestLabel = lq;
+        }
+      }
+      if (best > 1) best = 1;
+      own[i] = 1 - best;
+      mixTo[i] = bestLabel;
+      mix[i] = best;
+    }
+  }
+  return { own, mixTo, mix };
+}
+
+/**
+ * The traced coverage field of one region, sampled over a rectangle of the
+ * image: a pixel counts towards the region if it *is* the region (its own
+ * coverage) or if it partly belongs to it (its unmixed mix).
+ */
+export function layerField(
+  labels: Uint16Array,
+  cov: Coverage,
+  label: number,
+  w: number,
+  h: number,
+  x0: number,
+  y0: number,
+  fw: number,
+  fh: number,
+): Float32Array {
+  const field = new Float32Array(fw * fh);
+  for (let fy = 0; fy < fh; fy++) {
+    const sy = y0 + fy;
+    if (sy < 0 || sy >= h) continue;
+    const row = fy * fw;
+    for (let fx = 0; fx < fw; fx++) {
+      const sx = x0 + fx;
+      if (sx < 0 || sx >= w) continue;
+      const i = sy * w + sx;
+      field[row + fx] = labels[i] === label ? cov.own[i] : cov.mixTo[i] === label ? cov.mix[i] : 0;
+    }
+  }
+  return field;
+}
+
 /* ------------------------------------------------------------------ *
  * Marching squares on the coverage field
  * ------------------------------------------------------------------ */
@@ -634,9 +784,39 @@ export interface Contoured {
   curves: number;
 }
 
+/** Margin a field rectangle needs so the kernel never reads a region's own body. */
+export function fieldMargin(sigma: number): number {
+  return Math.max(2, Math.ceil(sigma * 3) + 1);
+}
+
 /**
- * Trace one region mask. Returns one entry per surviving contour, all in *image*
- * coordinates matching the mask's own pixel grid.
+ * Contour an already-built coverage field. `x0`/`y0` are the *image* coordinates
+ * of field sample (0, 0), whose pixel centre is (x0 + 0.5, y0 + 0.5).
+ */
+export function contoursForField(
+  field: Float32Array,
+  fw: number,
+  fh: number,
+  x0: number,
+  y0: number,
+  o: CoreOptions,
+): Contoured[] {
+  const rings = marchingSquares(field, fw, fh, x0, y0);
+  const out: Contoured[] = [];
+  for (const ring of rings) {
+    const area = Math.abs(ringArea(ring));
+    if (area < o.minArea) continue;
+    const curves = fitRing(ring, o);
+    const d = toPathData(curves, o.precision);
+    if (d) out.push({ d, area, curves: curves.length });
+  }
+  return out;
+}
+
+/**
+ * Trace one region mask (a hard 0/1 mask; used by the tests and by any caller
+ * that has already binarised). Returns one entry per surviving contour, all in
+ * *image* coordinates matching the mask's own pixel grid.
  */
 export function contoursForMask(
   mask: Uint8Array,
@@ -647,18 +827,9 @@ export function contoursForMask(
 ): Contoured[] {
   const [bx0, by0, bx1, by1] = bbox;
   if (bx1 < bx0 || by1 < by0) return [];
-  const margin = Math.max(2, Math.ceil(o.sigma * 3) + 1);
+  const margin = fieldMargin(o.sigma);
   const { field, fw, fh } = fieldFromMask(mask, w, h, bx0 - margin, by0 - margin, bx1 + margin, by1 + margin, o.sigma);
-  const rings = marchingSquares(field, fw, fh, bx0 - margin, by0 - margin);
-  const out: Contoured[] = [];
-  for (const ring of rings) {
-    const area = Math.abs(ringArea(ring));
-    if (area < o.minArea) continue;
-    const curves = fitRing(ring, o);
-    const d = toPathData(curves, o.precision);
-    if (d) out.push({ d, area, curves: curves.length });
-  }
-  return out;
+  return contoursForField(field, fw, fh, bx0 - margin, by0 - margin, o);
 }
 
 /** Per-label pixel count and bounding box, in one pass over the label map. */
