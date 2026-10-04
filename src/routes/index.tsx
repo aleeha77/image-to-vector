@@ -28,26 +28,50 @@ interface Loaded {
   type: string;
 }
 
-/** Draw the file to a canvas and re-encode it: strips EXIF, caps the size, keeps alpha. */
+/** Read the file as-is — no canvas, no re-encode. */
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => { resolve(String(reader.result)); };
+    reader.onerror = () => { reject(new Error("Could not read that file")); };
+    reader.readAsDataURL(file);
+  });
+}
+/**
+ * Hand the server the best copy of the file we can.
+ *
+ * There is deliberately no canvas round-trip unless the image has to be shrunk:
+ * drawing a photo through a canvas and re-encoding it as JPEG injects blocking
+ * and edge ringing, and the tracer then faithfully reproduces those artefacts as
+ * shapes. Below the size cap the original bytes go over untouched (the server
+ * bakes in EXIF orientation with sharp `rotate()`), and anything we do have to
+ * redraw is sent as PNG so the redraw itself stays lossless.
+ */
 async function prepareFile(file: File): Promise<Loaded> {
   const bitmap = await createImageBitmap(file);
   const long = Math.max(bitmap.width, bitmap.height);
   const scale = long > MAX_UPLOAD_EDGE ? MAX_UPLOAD_EDGE / long : 1;
   const width = Math.max(1, Math.round(bitmap.width * scale));
   const height = Math.max(1, Math.round(bitmap.height * scale));
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("This browser cannot read images");
-  ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(bitmap, 0, 0, width, height);
+  let dataUrl: string;
+  let type = (file.type.split("/")[1] || "image").toUpperCase();
+  if (scale === 1) {
+    dataUrl = await fileToDataUrl(file);
+  } else {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("This browser cannot read images");
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(bitmap, 0, 0, width, height);
+    dataUrl = canvas.toDataURL("image/png");
+    type = "PNG";
+  }
   bitmap.close();
-  const keepPng = /png|webp|gif|avif/i.test(file.type);
-  const dataUrl = canvas.toDataURL(keepPng ? "image/png" : "image/jpeg", 0.95);
   if (dataUrl.length * 0.75 > MAX_UPLOAD_BYTES) throw new Error("Image is too large — try one under 10 MB");
   const previewUrl = URL.createObjectURL(file);
-  return { name: file.name || "image", width, height, previewUrl, dataUrl, type: keepPng ? "PNG" : "JPG" };
+  return { name: file.name || "image", width, height, previewUrl, dataUrl, type };
 }
 
 function fmtBytes(n: number) {
