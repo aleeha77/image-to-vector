@@ -194,6 +194,14 @@ export const TUNING: Record<PresetId, PresetTuning> = {
   },
   // Textiles, dress prints, wallpaper: dense motifs, hairlines, fine dots.
   // Small sigma and small minArea so dots and 1px lines survive.
+  //
+  // Working resolution is deliberately 2x the source here (minDim === maxDim):
+  // a 1px hairline in the source is a 1px *anti-aliased* feature whose coverage
+  // varies from 0.5 to 1.0 along its own length, so on the source grid the line
+  // has no consistently-inked core — every threshold cuts it into dashes (the
+  // rules and square outlines rendered dashed). Resolving it at 2x gives the
+  // stroke a genuine core pixel, so it segments as one continuous hairline
+  // while the sub-pixel contour core still places its edges sub-pixel.
   pattern: {
     mode: "color",
     tolerance: [12, 18],
@@ -204,8 +212,8 @@ export const TUNING: Record<PresetId, PresetTuning> = {
     minArea: [1, 6],
     sigma: 0.45,
     cornerAngle: 32,
-    maxDim: 2200,
-    minDim: 900,
+    maxDim: 2800,
+    minDim: 2800,
     denoise: 1,
     blur: 0,
     saturation: 1.06,
