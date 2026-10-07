@@ -20,6 +20,7 @@
  */
 import sharp from "sharp";
 import { modalColours, segment } from "./segment";
+import { tracePhoto } from "./trace-photo.server";
 import {
   contoursForField,
   fieldMargin,
@@ -290,6 +291,12 @@ export async function traceImage(input: Buffer, options: TraceOptions): Promise<
   const t = TUNING[preset];
   const detail = clamp(options.detail ?? 0.5, 0, 1);
   const background = options.background ?? "#ffffff";
+
+  // Photographs are continuous tone, not flat regions: they run the previous
+  // colour-clustering engine (see trace-photo.server.ts) rather than the
+  // sub-pixel coverage core, which shatters gradients into mid-tone specks.
+  if (preset === "photo") return tracePhoto(input, { preset, detail, background });
+
   const steps: string[] = [];
   const core = coreOptions(preset, detail);
 
